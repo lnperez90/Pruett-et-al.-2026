@@ -1,0 +1,128 @@
+############################################################################
+# Retina cell-type subclustering (Anableps snRNA-seq)
+#
+# For each cell type (AC, MGC, BC, HC, RGC; add more in `params`):
+#   1. subset the cells from the full retina object (labels read from Idents)
+#   2. normalise, find variable genes (minus photoreceptor genes), scale, PCA
+#   3. cluster at the highest resolution that gives <= max_k subclusters
+#   4. UMAP, subcluster numbers 1..k
+#   5. markers per subcluster + top-3 dot plot
+#   6. save one object per cell type and the figures / tables
+############################################################################
+
+# ---- 0. Setup ---------------------------------------------------------------
+library(Seurat); library(patchwork); library(ggplot2); library(dplyr)
+set.seed(1)
+
+# full retina object (use the "-edited-Louise-9-26" file if that is the version you want)
+rds_path <- "C:/Users/lperez/Box/LP - SHARED FILES/nr2f2-Paper-2026/snRNAseq analysis/cones_only/Anableps_retina_FINAL-newAnnotation_noRPE3.rds"
+out_dir  <- "C:/Users/lperez/Box/nr2f2_Louise/Subclustering"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+obj <- readRDS(rds_path)
+print(levels(Idents(obj)))        # cell-type labels; the patterns below are matched against these
+
+# ---- 1. Settings per cell type ----------------------------------------------
+# pattern = text found in the cell-type label | dims = PCs used | max_k = maximum number of subclusters
+params <- list(
+  AC  = list(pattern = "amacrine",   dims = 1:15, max_k = 5),
+  MGC = list(pattern = "muller",     dims = 1:15, max_k = 5),
+  BC  = list(pattern = "bipolar",    dims = 1:10, max_k = 4),
+  HC  = list(pattern = "horizontal", dims = 1:10, max_k = 3),
+  RGC = list(pattern = "^RGC",       dims = 1:10, max_k = 4)
+)
+# to add another type, e.g.:  Rod = list(pattern = "^rod", dims = 1:10, max_k = 3)
+
+# core phototransduction genes: removed from the variable genes so the photoreceptor
+# ambient-RNA program cannot drive the PCs
+photo_core <- intersect(c("RHO","GUCA1A","GUCA1B","cngb3.2","cngb3.1","PDE6C","pde6ha.1","gnb3b","rp1l1a","inaa",
+                          "FRMPD2","FRMPD2.1","rgs9a","IMPG2","arr3a","PPEF1","rcvrn3","opn1mw1","opn1mw1.1","GNAT2",
+                          "PDE6A","PDE6B","rom1b","rom1a","cngb1a","GNAT1","gc2","MYO3A","abca4b","camk1gb",
+                          "ENSABLG00000019639"), rownames(obj))
+
+# ---- 2. Helper functions ----------------------------------------------------
+prep_sub <- function(obj, pattern, nfeat = 2000, npcs = 30, drop_genes = photo_core) {
+  labs <- grep(pattern, levels(Idents(obj)), ignore.case = TRUE, value = TRUE)
+  if (!length(labs)) stop("no cell-type label matches '", pattern, "'")
+  message("Groups: ", paste(labs, collapse = " | "))
+  s <- subset(obj, idents = labs)
+  s$orig_label <- as.character(Idents(s))
+  message("Cells: ", ncol(s)); print(table(s$orig_label))
+  s <- NormalizeData(s, verbose = FALSE)
+  s <- FindVariableFeatures(s, selection.method = "vst", nfeatures = nfeat, verbose = FALSE)
+  VariableFeatures(s) <- setdiff(VariableFeatures(s), drop_genes)
+  s <- ScaleData(s, features = VariableFeatures(s), verbose = FALSE)
+  RunPCA(s, features = VariableFeatures(s), npcs = min(npcs, ncol(s) - 1), verbose = FALSE)
+}
+
+# cluster at the highest resolution that still gives <= max_k clusters
+cluster_sub_k <- function(s, dims, max_k = 5, res_grid = seq(0.02, 1, by = 0.02)) {
+  s <- FindNeighbors(s, dims = dims, verbose = FALSE)
+  best <- res_grid[1]
+  for (r in res_grid) {
+    s <- FindClusters(s, resolution = r, verbose = FALSE)
+    if (length(unique(s$seurat_clusters)) <= max_k) best <- r else break
+  }
+  s <- FindClusters(s, resolution = best, verbose = FALSE)
+  message("resolution ", best, " -> ", length(unique(s$seurat_clusters)), " clusters")
+  s <- RunUMAP(s, dims = dims, verbose = FALSE)
+  s$subcluster <- factor(as.numeric(as.character(s$seurat_clusters)) + 1)   # number from 1
+  Idents(s) <- "subcluster"
+  s
+}
+
+# ---- 3. Subset, PCA, cluster, UMAP ------------------------------------------
+subs <- lapply(params, function(p) prep_sub(obj, p$pattern))
+names(subs) <- names(params)
+
+pdf(file.path(out_dir, "01_elbow_plots.pdf"), width = 14, height = 4)
+print(wrap_plots(lapply(names(subs), function(n) ElbowPlot(subs[[n]], ndims = 30) + ggtitle(n)), nrow = 1))
+dev.off()      # check that `dims` in `params` covers the elbow of each cell type
+
+subs <- Map(function(s, p) cluster_sub_k(s, p$dims, p$max_k), subs, params)
+
+# ---- 4. UMAPs of the subclusters --------------------------------------------
+for (n in names(subs)) {
+  p <- DimPlot(subs[[n]], group.by = "subcluster", label = TRUE, label.size = 5, pt.size = 0.8) +
+    ggtitle(paste(n, "subclusters")) + theme(plot.title = element_text(hjust = 0.5))
+  ggsave(file.path(out_dir, paste0(n, "_subclusters_UMAP.png")), p, width = 6.5, height = 5.5, dpi = 300)
+  ggsave(file.path(out_dir, paste0(n, "_subclusters_UMAP.pdf")), p, width = 6.5, height = 5.5)
+}
+pdf(file.path(out_dir, "02_all_subcluster_UMAPs.pdf"), width = 14, height = 8)
+print(wrap_plots(lapply(names(subs), function(n) DimPlot(subs[[n]], label = TRUE) + ggtitle(n)), nrow = 2))
+dev.off()
+
+# ---- 5. Quality checks: is a subcluster driven by one sample or by depth? ----
+for (n in names(subs)) {
+  s <- subs[[n]]
+  cat("\n=====", n, "=====\n")
+  if ("sample" %in% colnames(s@meta.data)) print(table(subcluster = s$subcluster, sample = s$sample))
+  print(table(subcluster = s$subcluster, original_label = s$orig_label))
+  print(round(tapply(s$nCount_RNA, s$subcluster, median)))
+}
+
+# ---- 6. Markers per subcluster + top-3 dot plot ------------------------------
+# (slowest step: a few minutes for the larger cell types)
+for (n in names(subs)) {
+  s  <- subs[[n]]
+  mk <- FindAllMarkers(s, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, verbose = FALSE)
+  top3 <- mk %>% group_by(cluster) %>% slice_max(avg_log2FC, n = 3, with_ties = FALSE) %>% ungroup()
+  write.csv(mk,   file.path(out_dir, paste0(n, "_markers_all.csv")),  row.names = FALSE)
+  write.csv(top3, file.path(out_dir, paste0(n, "_markers_top3.csv")), row.names = FALSE)
+
+  pd <- DotPlot(s, features = unique(top3$gene), group.by = "subcluster",
+                cols = c("#B9B2E6", "#4B3FB5"), dot.scale = 4) +
+    scale_y_discrete(limits = rev(levels(s$subcluster))) +      # subcluster 1 at the top
+    RotatedAxis() + labs(x = NULL, y = NULL, title = paste("Top 3 marker genes per", n, "subcluster")) +
+    theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(face = "italic", size = 8))
+  ggsave(file.path(out_dir, paste0(n, "_top3_markers_dotplot.png")), pd, width = 9, height = 4.5, dpi = 300)
+  ggsave(file.path(out_dir, paste0(n, "_top3_markers_dotplot.pdf")), pd, width = 9, height = 4.5)
+}
+
+# ---- 7. Save one object per cell type ----------------------------------------
+for (n in names(subs)) saveRDS(subs[[n]], file.path(out_dir, paste0(n, "_subclustered.rds")))
+write.csv(do.call(rbind, lapply(names(subs), function(n)
+  data.frame(cell_type = n, subcluster = names(table(subs[[n]]$subcluster)), n_cells = as.vector(table(subs[[n]]$subcluster))))),
+  file.path(out_dir, "subcluster_cell_counts.csv"), row.names = FALSE)
+
+message("Done. Outputs are in: ", normalizePath(out_dir))
