@@ -1,0 +1,340 @@
+############################################################################
+# Retina cell-type subclustering with contamination cleaning, and
+# nr2f2 / nr2f2b / nr2f5 expression per subcluster (Anableps)
+#
+# Groups:  AC  = amacrine (GABAergic + non-GABAergic)
+#          MGC = Muller glia 1 + 2
+#          BC  = bipolar cells
+#          HC  = horizontal cells
+#          RGC = RGC 1 + 2
+#
+# Pipeline
+#   1. subset each group, reprocess from scratch (photoreceptor genes kept out
+#      of the variable features), PCA
+#   2. subcluster at low resolution (capped number of clusters)
+#   3. score contamination (Muller / RPE / photoreceptor / oligodendrocyte /
+#      cycling) per cell
+#   4. remove contaminated cells, reprocess and recluster
+#   5. nr2f2, nr2f2b and nr2f5 together: % of cells expressing each gene and
+#      each combination, per cell type and per subcluster; dot plot
+#   6. save one cleaned object per cell type
+#
+# Gene names in the object: NR2F2 (= nr2f2b, assumption) | NR2F2.1 (= nr2f2, assumption) | nr2f5
+# Notes
+#   * Labels are read from Idents(obj); check the printout in section 0.
+#   * Subcluster numbers can shift slightly if you change seeds or Seurat
+#     versions, so re-check the numbers in the figures against your data.
+############################################################################
+
+# ---- 0. Setup ---------------------------------------------------------------
+library(Seurat); library(patchwork); library(ggplot2); library(dplyr)
+set.seed(1)
+
+# full retina object (change this path if you use the "-edited-Louise-9-26" version, which is the one the original DV_output came from)
+rds_path <- "C:/Users/lperez/Box/LP - SHARED FILES/nr2f2-Paper-2026/snRNAseq analysis/cones_only/Anableps_retina_FINAL-newAnnotation_noRPE3.rds"
+# new folder, so the existing DV_output results are not overwritten
+out_dir  <- "C:/Users/lperez/Box/nr2f2_Louise/Subclustering_clean"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+obj <- readRDS(rds_path)
+print(levels(Idents(obj)))   # should list cell-type names (Amacrine, Bipolar cell, RGC 1, ...)
+
+
+# ---- 1. Helper functions ----------------------------------------------------
+
+# core phototransduction genes: removed from the variable-gene list so the
+# cone/rod ambient-RNA program cannot drive the PCs
+photo_core <- intersect(c("RHO","GUCA1A","GUCA1B","cngb3.2","cngb3.1","PDE6C","pde6ha.1","gnb3b","rp1l1a","inaa",
+                          "FRMPD2","FRMPD2.1","rgs9a","IMPG2","arr3a","PPEF1","rcvrn3","opn1mw1","opn1mw1.1","GNAT2",
+                          "PDE6A","PDE6B","rom1b","rom1a","cngb1a","GNAT1","gc2","MYO3A","abca4b","camk1gb",
+                          "ENSABLG00000019639"), rownames(obj))
+
+# subset by label pattern, normalise, variable genes (minus photoreceptor genes), scale, PCA
+prep_sub <- function(obj, pattern, nfeat = 2000, npcs = 30, drop_genes = photo_core) {
+  labs <- grep(pattern, levels(Idents(obj)), ignore.case = TRUE, value = TRUE)
+  message("Groups: ", paste(labs, collapse = " | "))
+  s <- subset(obj, idents = labs)
+  s$orig_label <- as.character(Idents(s))
+  message("Cells: ", ncol(s)); print(table(s$orig_label))
+  s <- NormalizeData(s, verbose = FALSE)
+  s <- FindVariableFeatures(s, selection.method = "vst", nfeatures = nfeat, verbose = FALSE)
+  VariableFeatures(s) <- setdiff(VariableFeatures(s), drop_genes)
+  s <- ScaleData(s, features = VariableFeatures(s), verbose = FALSE)
+  RunPCA(s, features = VariableFeatures(s), npcs = min(npcs, ncol(s) - 1), verbose = FALSE)
+}
+
+# cluster at the highest resolution that still gives <= max_k clusters
+cluster_sub_k <- function(s, dims, max_k = 5, res_grid = seq(0.05, 1, by = 0.05)) {
+  s <- FindNeighbors(s, dims = dims, verbose = FALSE)
+  best <- res_grid[1]
+  for (r in res_grid) {
+    s <- FindClusters(s, resolution = r, verbose = FALSE)
+    if (length(unique(s$seurat_clusters)) <= max_k) best <- r else break
+  }
+  s <- FindClusters(s, resolution = best, verbose = FALSE)
+  message("resolution ", best, " -> ", length(unique(s$seurat_clusters)), " clusters")
+  print(table(s$seurat_clusters))
+  s <- RunUMAP(s, dims = dims, verbose = FALSE)
+  s$subcluster <- factor(as.numeric(as.character(s$seurat_clusters)) + 1)   # number from 1
+  Idents(s) <- "subcluster"
+  s
+}
+
+# group definitions: label pattern, PCs used for clustering, maximum number of subclusters
+params <- list(
+  AC  = list(pattern = "amacrine",   dims = 1:15, max_k = 5),
+  MGC = list(pattern = "muller",     dims = 1:15, max_k = 5),
+  BC  = list(pattern = "bipolar",    dims = 1:10, max_k = 4),
+  HC  = list(pattern = "horizontal", dims = 1:10, max_k = 3),
+  RGC = list(pattern = "^RGC",       dims = 1:10, max_k = 4)
+)
+
+
+# ---- 2. First pass: subset, PCA, cluster ------------------------------------
+subs <- lapply(params, function(p) prep_sub(obj, p$pattern))
+
+pdf(file.path(out_dir, "01_elbow_first_pass.pdf"), width = 14, height = 4)
+print(wrap_plots(lapply(names(subs), function(n) ElbowPlot(subs[[n]], ndims = 30) + ggtitle(n)), nrow = 1))
+dev.off()
+
+subs <- Map(function(s, p) cluster_sub_k(s, p$dims, p$max_k), subs, params)
+pdf(file.path(out_dir, "02_umap_first_pass.pdf"), width = 12, height = 8)
+print(wrap_plots(lapply(names(subs), function(n) DimPlot(subs[[n]], label = TRUE) + ggtitle(n)), nrow = 2))
+dev.off()
+
+
+# ---- 3. Contamination scores --------------------------------------------------
+contam_sets <- list(
+  Muller  = c("rlbp1a", "RHBG", "notch1b"),
+  RPE     = c("rpe65a", "tyrp1b"),
+  Photo   = c("RHO", "GUCA1A", "cngb3.2", "IMPG2", "elovl8a", "opn1mw1.1", "cnga3a"),
+  Oligo   = c("MAG", "MYRF", "UGT8"),
+  Cycling = c("mki67", "TOP2A", "ECT2", "FOXN4", "MYBL1", "CCND1")
+)
+add_contam <- function(s, skip = NULL) {
+  for (n in setdiff(names(contam_sets), skip)) {
+    g <- intersect(contam_sets[[n]], rownames(s))
+    s <- AddModuleScore(s, features = list(g), name = n)       # adds <name>1
+  }
+  s
+}
+# Muller glia are skipped for the Muller score (it would be high by identity)
+subs <- Map(function(s, n) add_contam(s, skip = if (n == "MGC") "Muller" else NULL), subs, names(subs))
+
+pdf(file.path(out_dir, "03_contamination_violins.pdf"), width = 14, height = 4)
+for (n in names(subs)) {
+  feats <- intersect(c("Muller1", "RPE1", "Photo1", "Oligo1", "Cycling1"), colnames(subs[[n]]@meta.data))
+  print(VlnPlot(subs[[n]], features = feats, pt.size = 0, ncol = 5) + plot_annotation(title = n))
+  cat("\n=====", n, "- % cells with score > 0.5, by subcluster =====\n")
+  pct <- sapply(feats, function(f) round(100 * tapply(subs[[n]][[f, drop = TRUE]] > 0.5, subs[[n]]$subcluster, mean), 1))
+  print(cbind(n_cells = as.vector(table(subs[[n]]$subcluster)), pct))
+}
+dev.off()
+
+
+# ---- 4. Filter contaminated cells -------------------------------------------
+thr        <- 0.5      # a cell is removed if ANY contamination score exceeds this
+bad_cluster_frac <- 0.6  # a whole subcluster is removed if more than this fraction is flagged
+score_cols <- c("Muller1", "RPE1", "Photo1", "Oligo1", "Cycling1")
+
+keep_cells <- Map(function(s, n) {
+  cols    <- intersect(score_cols, colnames(s@meta.data))
+  flagged <- rowSums(s@meta.data[, cols, drop = FALSE] > thr) > 0
+  ok      <- !flagged
+  frac    <- tapply(flagged, s$subcluster, mean)
+  bad     <- names(frac)[frac > bad_cluster_frac]
+  if (length(bad)) {
+    message(n, ": removing whole subcluster(s) ", paste(bad, collapse = ","), " (> ", 100 * bad_cluster_frac, "% flagged)")
+    ok <- ok & !(s$subcluster %in% bad)
+  }
+  colnames(s)[ok]
+}, subs, names(subs))
+
+print(sapply(names(subs), function(n) c(before = ncol(subs[[n]]), after = length(keep_cells[[n]]))))
+
+
+# ---- 5. Reprocess clean cells and recluster ------------------------------------
+subs2 <- Map(function(n, p) prep_sub(subset(obj, cells = keep_cells[[n]]), p$pattern), names(params), params)
+names(subs2) <- names(params)
+
+pdf(file.path(out_dir, "04_elbow_clean.pdf"), width = 14, height = 4)
+print(wrap_plots(lapply(names(subs2), function(n) ElbowPlot(subs2[[n]], ndims = 30) + ggtitle(n)), nrow = 1))
+dev.off()
+
+subs2 <- Map(function(s, p) cluster_sub_k(s, p$dims, p$max_k, res_grid = seq(0.02, 1, by = 0.02)), subs2, params)
+pdf(file.path(out_dir, "05_umap_clean.pdf"), width = 12, height = 8)
+print(wrap_plots(lapply(names(subs2), function(n) DimPlot(subs2[[n]], label = TRUE) + ggtitle(n)), nrow = 2))
+dev.off()
+
+# sanity checks: are any subclusters driven by one sample or by depth?
+for (n in names(subs2)) {
+  s <- subs2[[n]]
+  cat("\n=====", n, "=====\n")
+  print(table(subcluster = s$subcluster, sample = s$sample))
+  print(table(subcluster = s$subcluster, label = s$orig_label))
+  print(round(tapply(s$nFeature_RNA, s$subcluster, median)))     # median genes per cell
+}
+
+
+# ---- 6. nr2f2, nr2f2b and nr2f5 together ------------------------------------------
+nr2f_genes <- c(nr2f2b = "NR2F2", nr2f2 = "NR2F2.1", nr2f5 = "nr2f5")      # label = gene name in the object
+nr2f_genes <- sapply(nr2f_genes, function(g) { m <- rownames(obj)[tolower(rownames(obj)) == tolower(g)]; if (length(m)) m[1] else stop("gene not found: ", g) })
+
+summ <- do.call(rbind, lapply(names(subs2), function(n) {
+  s <- subs2[[n]]
+  e <- FetchData(s, unname(nr2f_genes)) > 0                                   # expressed = normalized value > 0
+  colnames(e) <- names(nr2f_genes)
+  df <- data.frame(cell_type = n, subcluster = as.character(s$subcluster), e)
+  by_sub <- lapply(c(list(All = rep(TRUE, nrow(df))), split(seq_len(nrow(df)), df$subcluster)), function(i) {
+    d <- df[i, , drop = FALSE]
+    data.frame(n_cells = nrow(d),
+               n_nr2f2b = sum(d$nr2f2b), n_nr2f2 = sum(d$nr2f2), n_nr2f5 = sum(d$nr2f5),
+               pct_nr2f2b = round(100 * mean(d$nr2f2b), 1), pct_nr2f2 = round(100 * mean(d$nr2f2), 1), pct_nr2f5 = round(100 * mean(d$nr2f5), 1),
+               n_2b_and_5 = sum(d$nr2f2b & d$nr2f5), n_2_and_5 = sum(d$nr2f2 & d$nr2f5),
+               n_2b_and_2 = sum(d$nr2f2b & d$nr2f2), n_none = sum(!d$nr2f2b & !d$nr2f2 & !d$nr2f5))
+  })
+  out <- do.call(rbind, by_sub); out$subcluster <- rownames(out); out$cell_type <- n; out
+}))
+write.csv(summ, file.path(out_dir, "nr2f2_nr2f2b_nr2f5_summary_by_subcluster.csv"), row.names = FALSE)
+print(summ[summ$subcluster == "All", ])
+
+# dot plot of the three genes in every subcluster
+for (n in names(subs2)) {
+  p <- DotPlot(subs2[[n]], features = unname(nr2f_genes), group.by = "subcluster", cols = c("#B9B2E6", "#4B3FB5"), dot.scale = 6) +
+    scale_y_discrete(limits = rev(levels(subs2[[n]]$subcluster))) + RotatedAxis() +
+    labs(x = NULL, y = NULL, title = paste(n, ": nr2f2b (NR2F2), nr2f2 (NR2F2.1), nr2f5")) +
+    theme(plot.title = element_text(hjust = 0.5, size = 11))
+  ggsave(file.path(out_dir, paste0(n, "_nr2f_dotplot.png")), p, width = 5, height = 4, dpi = 300)
+  ggsave(file.path(out_dir, paste0(n, "_nr2f_dotplot.pdf")), p, width = 5, height = 4)
+}
+
+
+# ---- 7. Save processed objects ----------------------------------------------------
+for (n in names(subs2)) {
+  saveRDS(subs2[[n]], file.path(out_dir, paste0(n, "_subclustered_clean.rds")))   # e.g. MGC_subclustered_clean.rds
+}
+message("Done. Outputs are in: ", normalizePath(out_dir))
+
+
+
+
+library(Seurat); library(ggplot2); library(patchwork)
+
+# ---------------- 0. paths ----------------
+rds_folder <- "C:/Users/lperez/Box/Perez_NatComms_resub_July_2026/RDS"
+cone_path  <- file.path(rds_folder, "aanew_cones_clean_subclustered.rds")
+out_dir    <- "C:/Users/lperez/Box/nr2f2_Louise"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+cone <- readRDS(cone_path)
+
+# ---------------- 1. style (as in the published cone figure) ----------------
+col_d  <- "#FF00FF"    # dorsal  (magenta)
+col_v  <- "#00CC00"    # ventral (green)
+col_b  <- "#F5C518"    # both    (yellow)
+col_n  <- "#CCCCCC"    # neither
+purple <- "#4B3FB5"    # expression gradient
+cols   <- c(Dorsal = col_d, Ventral = col_v, Both = col_b, None = col_n)
+pt     <- 0.5
+tag_theme <- theme(plot.tag = element_text(face = "bold", size = 22), plot.tag.position = "topleft")
+
+get_leg <- function(p) {
+  g <- ggplotGrob(p); gb <- g$grobs[grepl("^guide-box", sapply(g$grobs, function(x) x$name))]
+  Filter(function(x) !inherits(x, "zeroGrob"), gb)[[1]]
+}
+
+# ---------------- 2. one row (a-d + extra bar) for one drawing order ----------------
+# draw_order: "default" = object order (like Seurat FeaturePlot) | "top" = grey underneath, expressing cells on top
+make_row <- function(gd, ld, gv, lv, draw_order, tg, first_row) {
+  co <- Embeddings(cone, "umap")
+  e  <- FetchData(cone, c(gd, gv))
+  d  <- e[[1]] > 0; v <- e[[2]] > 0
+  cls <- factor(ifelse(d & v, "Both", ifelse(d, "Dorsal", ifelse(v, "Ventral", "None"))),
+                levels = c("None", "Dorsal", "Ventral", "Both"))
+  ttl <- function(prefix, lab) bquote(underline(.(prefix) * " (" * italic(.(lab)) * ")"))
+  set.seed(1)
+
+  expr_panel <- function(x, title, letter) {
+    mx <- max(x); if (mx == 0) mx <- 1
+    o <- if (draw_order == "default") seq_along(x) else order(x > 0, runif(length(x)))
+    p <- ggplot(data.frame(u1 = co[o, 1], u2 = co[o, 2], x = x[o]), aes(u1, u2, color = x)) +
+      geom_point(size = pt) +
+      scale_color_gradient(low = "grey85", high = purple, limits = c(0, mx), guide = "none") +
+      labs(tag = letter) + theme_void() + tag_theme +
+      theme(plot.title = element_text(hjust = 0.5, size = 12))
+    if (first_row) p <- p + ggtitle(title)
+    p
+  }
+  pa <- expr_panel(e[[1]], ttl("Dorsal retina marker", ld), tg[1])
+  pb <- expr_panel(e[[2]], ttl("Ventral retina marker", lv), tg[2])
+
+  oc <- if (draw_order == "default") seq_along(cls) else
+        order(match(as.character(cls), c("None", "Dorsal", "Ventral", "Both")), runif(length(cls)))
+  pc <- ggplot(data.frame(u1 = co[oc, 1], u2 = co[oc, 2], cls = cls[oc]), aes(u1, u2, color = cls)) +
+    geom_point(size = pt) + scale_color_manual(values = cols, guide = "none") +
+    labs(tag = tg[3]) + theme_void() + tag_theme +
+    theme(plot.title = element_text(hjust = 0.5, size = 12))
+  if (first_row) pc <- pc + ggtitle(bquote(underline("Cells expressing DV markers")))
+
+  tab_all <- as.data.frame(table(class = cls), responseName = "n")
+  bar_one <- function(tab, ylab_txt, letter = NULL) {
+    tab$class <- factor(tab$class, levels = c("None", "Both", "Dorsal", "Ventral"))
+    tab$pct <- 100 * tab$n / sum(tab$n); tab$g <- "Cones"
+    p <- ggplot(tab, aes(g, pct, fill = class)) + geom_col(width = 0.55) +
+      scale_fill_manual(values = cols, guide = "none", drop = FALSE) +
+      scale_x_discrete(labels = paste0("Cones\n(n = ", format(sum(tab$n), big.mark = ","), ")")) +
+      scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 10), expand = c(0, 0)) +
+      labs(x = NULL, y = ylab_txt) + theme_classic(base_size = 9)
+    if (!is.null(letter)) p <- p + labs(tag = letter) + tag_theme
+    p
+  }
+  pd1 <- bar_one(tab_all[tab_all$class != "None", ], "Proportion of expressing cells (%)", tg[4])
+  pd2 <- bar_one(tab_all, "Proportion of all cells (%)")
+
+  lab <- if (draw_order == "default") "Default order (object order)" else "Expressing cells on top"
+  hdr <- ggplot() + annotate("text", x = 0.5, y = 0.6, label = lab, size = 5) +
+    annotate("segment", x = 0, xend = 1, y = 0.08, yend = 0.08, linewidth = 0.3) +
+    xlim(0, 1) + ylim(0, 1) + theme_void()
+  row <- wrap_plots(pa, pb, pc, pd1, pd2, nrow = 1, widths = c(1, 1, 1, 0.3, 0.3))
+  wrap_plots(hdr, row, ncol = 1, heights = c(0.08, 1))
+}
+
+# ---------------- 3. figure for one gene pair: default (top row) vs expressing-on-top (bottom row) ----------------
+pair_fig <- function(gd, ld, gv, lv, tag) {
+  r1 <- make_row(gd, ld, gv, lv, "default", letters[1:4], TRUE)
+  r2 <- make_row(gd, ld, gv, lv, "top",     letters[5:8], FALSE)
+
+  leg_expr <- get_leg(ggplot(data.frame(x = c(0, 1), y = 0), aes(x, y, color = x)) + geom_point() +
+    scale_color_gradient(low = "grey85", high = purple, name = "Log2 Expr.", breaks = c(0, 1), labels = c("min", "max")) +
+    theme(legend.position = "bottom", legend.direction = "horizontal"))
+  lab <- as.expression(list(bquote("Dorsal (" * italic(.(ld))^"+" * ")"), bquote("Ventral (" * italic(.(lv))^"+" * ")"),
+                            bquote("Both (" * italic(.(ld))^"+" * "/" * italic(.(lv))^"+" * ")"), "None"))
+  leg_cls <- get_leg(ggplot(data.frame(x = 1:4, y = 0, c = factor(c("Dorsal", "Ventral", "Both", "None"),
+                                                                   levels = c("Dorsal", "Ventral", "Both", "None"))),
+                            aes(x, y, color = c)) + geom_point(size = 4) +
+    scale_color_manual(values = cols, name = NULL, labels = lab) +
+    theme(legend.position = "bottom", legend.direction = "vertical"))
+  legs <- wrap_plots(wrap_elements(full = leg_expr), wrap_elements(full = leg_cls), nrow = 1)
+
+  fig <- wrap_plots(r1, r2, legs, ncol = 1, heights = c(1, 1, 0.4))
+  f <- file.path(out_dir, paste0("Cones_published_style_orders_", tag))
+  ggsave(paste0(f, ".pdf"), fig, width = 13, height = 9)
+  ggsave(paste0(f, ".png"), fig, width = 13, height = 9, dpi = 300)
+  message("Saved: ", f, ".png")
+  invisible(fig)
+}
+
+# ---------------- 4. run ----------------
+# find the gene name in the object whatever its capitalization (e.g. cngb3.2 / CNGB3.2, ephb3 / EPHB3)
+find_gene <- function(x) {
+  g <- rownames(cone)[tolower(rownames(cone)) == tolower(x)]
+  if (length(g) == 0) stop("gene not found in the object: ", x,
+                           "\nTry: grep('cngb3|ephb3', rownames(cone), ignore.case = TRUE, value = TRUE)")
+  g[1]
+}
+
+# same genes as your published figure: dorsal = cngb3.2, ventral = ephb3
+pair_fig(find_gene("cngb3.2"), "cngb3.2", find_gene("ephb3"), "ephb3", "cngb3.2_ephb3")
+
+# nr2f pairs (optional)
+# pair_fig("NR2F2",   "nr2f2b", "nr2f5", "nr2f5", "nr2f2b_nr2f5")
+# pair_fig("NR2F2.1", "nr2f2",  "nr2f5", "nr2f5", "nr2f2_nr2f5")
