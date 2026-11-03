@@ -1,0 +1,79 @@
+
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+df <- read_excel("Aa_eye_development-nr2fs.xlsx")
+df_long <- df %>%
+pivot_longer(
+cols = c(
+ST2AA1, ST2AA3, ST2AA-T3,
+AAst3_1, AAst3_2, AAst3_3,
+ST4AA2, ST4AA3, ST4AA4,
+ST5AA1, ST5AA2, ST5AA4,
+ADUAA2, ADUAA3, ADUAA4
+),
+names_to = "sample",
+values_to = "expression"
+) %>%
+mutate(
+stage = case_when(
+str_detect(sample, "^ST2")  ~ "Stage2",
+str_detect(sample, "^AAst3")~ "Stage3",
+str_detect(sample, "^ST4")  ~ "Stage4",
+str_detect(sample, "^ST5")  ~ "Stage5",
+str_detect(sample, "^ADU")  ~ "Adult"
+)
+)
+df_long$stage <- factor(
+df_long$stage,
+levels = c("Stage2", "Stage3", "Stage4", "Stage5", "Adult")
+)
+df_long <- df_long %>%
+mutate(expression_log = log2(expression + 1))
+p <- ggplot(df_long, aes(x = stage, y = expression_log, color = stage)) +
+Boxplotgeom_boxplot(
+outlier.shape = NA,
+alpha = 0.3,
+width = 0.55
+) +Jittered pointsgeom_jitter(
+width = 0.15,
+size = 3,
+alpha = 0.85
+) +Mean ± SEstat_summary(fun = mean, geom = "point", size = 4, shape = 18) +
+stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) 
++(LOG SCALE)stat_compare_means(
+method = "kruskal.test",
+label = "p.format",
+label.y = max(df_long$expression_log) + 0.7
+) +Pairwise Wilcoxon (LOG SCALE)stat_compare_means(
+method = "wilcox.test",
+comparisons = list(
+c("Stage2", "Stage3"),
+c("Stage3", "Stage4"),
+c("Stage4", "Stage5"),
+c("Stage5", "Adult")
+),
+label = "p.signif"
+) +
+
+scale_color_manual(values = c(
+"Stage2" = "#1B9E77",
+"Stage3" = "#66A61E",
+"Stage4" = "#7570B3",
+"Stage5" = "#E7298A",
+"Adult"  = "#E6AB02"
+)) +
+
+theme_classic() +
+theme(
+legend.position = "none",
+plot.title = element_text(face = "bold", size = 14)
+) +
+
+labs(
+y = "log2(DESeq2 normalized counts + 1)",
+x = "",
+title = unique(df$Gene_symbol)
+)
+
+print(p)
